@@ -14,6 +14,13 @@ import { getSolBalance, getTokenBalance, getMintDecimals, isLikelyMint } from ".
 import { getTokenInfo, SOL_MINT } from "./jupiter.js";
 import { executeSwap } from "./swap.js";
 import { recordBuy, clearPosition, getPositionsGroupedByMint } from "./positions.js";
+import { 
+  startPumpFunSniper, 
+  stopPumpFunSniper, 
+  isSniperRunning,
+  getSnipedTokens,
+  cancelAutoSell 
+} from "./pumpfun-snipe.js";
 
 const OWNER_ID = Number(process.env.OWNER_ID);
 const BUY_SLIPPAGE_BPS = Number(process.env.BUY_SLIPPAGE_BPS || 2500);
@@ -60,6 +67,11 @@ bot.start((ctx) =>
       "/setamount <label> <sol> — set one wallet's Quick Buy size\n" +
       "/positions — show tracked token positions, with one-tap Sell All\n" +
       "/sellall — instantly sell every tracked position, every wallet\n\n" +
+      "🎯 Sniper Commands:\n" +
+      "/snipestart — start auto-buying your pump.fun launches\n" +
+      "/snipestop — stop the sniper\n" +
+      "/snipestatus — check sniper status and sniped tokens\n" +
+      "/cancelsell <mint> — cancel scheduled auto-sell\n\n" +
       "To buy: paste a token mint address, then either tap ⚡ Quick Buy " +
       "(uses each wallet's preset) or type per-wallet amounts like `1:0.04 2:0.12`.\n" +
       "Selling always converts the full token balance back to SOL."
@@ -149,6 +161,60 @@ bot.command("sellall", async (ctx) => {
   await ctx.reply(`Panic-selling ${groups.length} token(s) across all wallets...`);
   for (const g of groups) {
     await sellMintAcrossWallets(ctx, g.mint);
+  }
+});
+
+// Pump.fun Sniper Commands
+bot.command("snipestart", (ctx) => {
+  if (isSniperRunning()) {
+    return ctx.reply("🎯 Sniper is already running.");
+  }
+  
+  if (!process.env.PUMPFUN_DEV_WALLET) {
+    return ctx.reply("❌ PUMPFUN_DEV_WALLET not set in .env");
+  }
+  
+  startPumpFunSniper((msg) => ctx.reply(msg));
+  ctx.reply(
+    "🎯 Pump.fun Sniper STARTED\n\n" +
+    `Monitoring dev wallet: ${process.env.PUMPFUN_DEV_WALLET.slice(0, 12)}...\n` +
+    `Auto-buy wallets: ${process.env.PUMPFUN_BOT_WALLET_IDS || "2,3,4,5"}\n` +
+    `Buy amount: ${process.env.PUMPFUN_BUY_AMOUNT_SOL || 0.05} SOL per wallet\n\n` +
+    "I'll notify you instantly when a new token is detected and bought."
+  );
+});
+
+bot.command("snipestop", (ctx) => {
+  if (!isSniperRunning()) {
+    return ctx.reply("Sniper is not running.");
+  }
+  stopPumpFunSniper();
+  ctx.reply("🛑 Sniper stopped.");
+});
+
+bot.command("snipestatus", (ctx) => {
+  const running = isSniperRunning();
+  const sniped = getSnipedTokens();
+  
+  ctx.reply(
+    `🎯 Sniper Status: ${running ? "RUNNING ✅" : "STOPPED ❌"}\n\n` +
+    `Dev Wallet: ${process.env.PUMPFUN_DEV_WALLET?.slice(0, 16) || "Not set"}...\n` +
+    `Bot Wallets: ${process.env.PUMPFUN_BOT_WALLET_IDS || "2,3,4,5"}\n` +
+    `Buy Amount: ${process.env.PUMPFUN_BUY_AMOUNT_SOL || 0.05} SOL\n` +
+    `Auto-sell: ${process.env.PUMPFUN_AUTO_SELL === "true" ? "ENABLED" : "disabled"}\n\n` +
+    `Tokens sniped this session: ${sniped.length}\n` +
+    (sniped.length > 0 ? sniped.slice(-5).map(m => `• ${m.slice(0, 8)}...`).join("\n") : "")
+  );
+});
+
+bot.command("cancelsell", (ctx) => {
+  const mint = ctx.message.text.split(/\s+/)[1];
+  if (!mint) return ctx.reply("Usage: /cancelsell <mint_address>");
+  
+  if (cancelAutoSell(mint)) {
+    ctx.reply(`⏱️ Auto-sell cancelled for ${mint.slice(0, 8)}...`);
+  } else {
+    ctx.reply("No auto-sell scheduled for that token.");
   }
 });
 
