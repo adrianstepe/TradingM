@@ -24,7 +24,7 @@ const DEV_WALLET = process.env.PUMPFUN_DEV_WALLET; // Your pump.fun dev wallet p
 const BOT_WALLET_IDS = (process.env.PUMPFUN_BOT_WALLET_IDS || "2,3,4,5")
   .split(",")
   .map(s => Number(s.trim())); // Default: wallets 2,3,4,5 (your 4 bot wallets)
-const BUY_AMOUNT_SOL = Number(process.env.PUMPFUN_BUY_AMOUNT_SOL || 0.05); // SOL per wallet
+const BUY_AMOUNT_SOL = Number(process.env.PUMPFUN_BUY_AMOUNT_SOL || 0.05); // SOL per wallet fallback
 const BUY_SLIPPAGE_BPS = Number(process.env.PUMPFUN_SNIPER_SLIPPAGE_BPS || 3000);
 const AUTO_SELL_ENABLED = process.env.PUMPFUN_AUTO_SELL === "true";
 const AUTO_SELL_DELAY_MS = Number(process.env.PUMPFUN_AUTO_SELL_DELAY_MS || 30000); // 30s default
@@ -53,7 +53,8 @@ export function startPumpFunSniper(sendNotification) {
 
   console.log(`[Sniper] Starting monitor for dev wallet: ${DEV_WALLET}`);
   console.log(`[Sniper] Will buy with wallets: ${BOT_WALLET_IDS.join(", ")}`);
-  console.log(`[Sniper] Buy amount: ${BUY_AMOUNT_SOL} SOL per wallet`);
+  console.log(`[Sniper] Default buy amount fallback: ${BUY_AMOUNT_SOL} SOL per wallet`);
+  console.log(`[Sniper] Sniper will use each wallet's defaultBuySol when set (fallback to the env value).`);
 
   // Load previously sniped tokens from state to avoid re-buying
   const state = getState();
@@ -155,6 +156,10 @@ async function handlePumpFunLogs(logs, sendNotification) {
 
 /**
  * Execute buy across all configured bot wallets
+ *
+ * Changes:
+ * - Use per-wallet wallet.defaultBuySol when present (>0), otherwise fall back to BUY_AMOUNT_SOL.
+ * - Record the actual amount spent per wallet and report totals accurately.
  */
 async function executeSniperBuy(mint, sendNotification) {
   const startTime = Date.now();
@@ -183,10 +188,21 @@ async function executeSniperBuy(mint, sendNotification) {
   const results = await Promise.allSettled(
     wallets.map(async (wallet) => {
       try {
+        // Determine per-wallet amount
+        // Use wallet.defaultBuySol if explicitly set (>0). Otherwise fall back to BUY_AMOUNT_SOL.
+        const amountSol = wallet.defaultBuySol && wallet.defaultBuySol > 0 ? wallet.defaultBuySol : BUY_AMOUNT_SOL;
+
+        // If you want sniping to SKIP wallets that do not have a defaultBuySol set,
+        // change the above line to:
+        // if (!wallet.defaultBuySol || wallet.defaultBuySol <= 0) {
+        //   return { success: false, wallet: wallet.label, error: "no defaultBuySol configured" };
+        // }
+        // and remove the fallback to BUY_AMOUNT_SOL.
+
         const solBal = await getSolBalanceWithConnection(wallet.pubkey);
-        if (solBal < BUY_AMOUNT_SOL + FEE_RESERVE_SOL) {
+        if (solBal < amountSol + FEE_RESERVE_SOL) {
           throw new Error(
-            `Insufficient SOL: has ${solBal.toFixed(4)}, needs ${(BUY_AMOUNT_SOL + FEE_RESERVE_SOL).toFixed(4)}`
+            `Insufficient SOL: has ${solBal.toFixed(4)}, needs ${(amountSol + FEE_RESERVE_SOL).toFixed(4)}`
           );
         }
 
@@ -194,18 +210,18 @@ async function executeSniperBuy(mint, sendNotification) {
           keypair: getKeypairFor(wallet),
           inputMint: SOL_MINT,
           outputMint: mint,
-          amount: Math.round(BUY_AMOUNT_SOL * 1e9),
+          amount: Math.round(amountSol * 1e9),
           maxSlippageBps: BUY_SLIPPAGE_BPS,
         });
 
-        // Record position
+        // Record position with the actual amountSol used
         recordBuy({
           walletId: wallet.id,
           mint,
           symbol,
           decimals,
           boughtRaw: quote.outAmount,
-          solSpent: BUY_AMOUNT_SOL,
+          solSpent: amountSol,
         });
 
         const received = Number(quote.outAmount) / 10 ** (decimals || 9);
@@ -217,6 +233,7 @@ async function executeSniperBuy(mint, sendNotification) {
           received,
           signature,
           retried,
+          solSpent: amountSol,
         };
 
       } catch (err) {
@@ -231,7 +248,7 @@ async function executeSniperBuy(mint, sendNotification) {
 
   // Compile results
   const duration = Date.now() - startTime;
-  const successes = results.filter(r => r.value?.success);
+  const successes = results.filter(r => r.value?.success).map(r => r.value);
   const failures = results.filter(r => !r.value?.success);
 
   // Build report
@@ -242,18 +259,17 @@ async function executeSniperBuy(mint, sendNotification) {
     `Success: ${successes.length}/${wallets.length} wallets`,
   ];
 
-  successes.forEach(r => {
-    const v = r.value;
-    lines.push(`✓ ${v.wallet}: +${v.received.toLocaleString()} tokens${v.retried}`);
+  successes.forEach(v => {
+    lines.push(`✓ ${v.wallet}: +${v.received.toLocaleString()} tokens${v.retried} (spent ${v.solSpent} SOL)`);
   });
 
   failures.forEach(r => {
     const v = r.value;
-    lines.push(`✗ ${v.wallet}: ${v.error}`);
+    lines.push(`✗ ${v?.wallet || "unknown"}: ${v?.error || (r.reason?.message || r.reason)}`);
   });
 
-  const totalSolSpent = successes.length * BUY_AMOUNT_SOL;
-  lines.push("", `Total SOL spent: ${totalSolSpent}`);
+  const totalSolSpent = successes.reduce((s, v) => s + (v.solSpent || 0), 0);
+  lines.push("", `Total SOL spent: ${totalSolSpent} SOL`);
 
   console.log("[Sniper]", lines.join("\n"));
   sendNotification?.(lines.join("\n"));
